@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 
-namespace DZen.Security.Cryptography.Tests
+namespace Temnij.Security.Cryptography.Tests
 {
     public static class Extensions
     {

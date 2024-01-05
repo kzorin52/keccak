@@ -1,6 +1,6 @@
 using Xunit;
 
-namespace DZen.Security.Cryptography.Tests
+namespace Temnij.Security.Cryptography.Tests
 {
     public class SHA3Tests : Tests
     {

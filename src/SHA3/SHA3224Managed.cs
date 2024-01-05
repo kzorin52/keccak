@@ -1,10 +1,4 @@
-namespace DZen.Security.Cryptography
+namespace Temnij.Security.Cryptography
 {
-    public class SHA3224Managed : SHA3Managed
-    {
-        public SHA3224Managed()
-            : base(224)
-        {
-        }
-    }
+    public class SHA3224Managed() : SHA3Managed(224);
 }

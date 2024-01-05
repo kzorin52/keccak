@@ -1,402 +1,413 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
-namespace DZen.Security.Cryptography
+namespace Temnij.Security.Cryptography;
+
+public abstract class SHA3Managed : SHA3
 {
-    public abstract class SHA3Managed : SHA3
+    private const int KeccakNumberOfRounds = 24;
+    private const int KeccakLaneSizeInBits = 8 * 8;
+
+    private static readonly ReadOnlyMemory<ulong> RoundConstants = new(
+    [
+        0x0000000000000001UL,
+        0x0000000000008082UL,
+        0x800000000000808aUL,
+        0x8000000080008000UL,
+        0x000000000000808bUL,
+        0x0000000080000001UL,
+        0x8000000080008081UL,
+        0x8000000000008009UL,
+        0x000000000000008aUL,
+        0x0000000000000088UL,
+        0x0000000080008009UL,
+        0x000000008000000aUL,
+        0x000000008000808bUL,
+        0x800000000000008bUL,
+        0x8000000000008089UL,
+        0x8000000000008003UL,
+        0x8000000000008002UL,
+        0x8000000000000080UL,
+        0x000000000000800aUL,
+        0x800000008000000aUL,
+        0x8000000080008081UL,
+        0x8000000000008080UL,
+        0x0000000080000001UL,
+        0x8000000080008008UL
+    ]);
+
+    private readonly int _keccakR;
+    private Memory<byte> _buffer;
+    private int _buffLength;
+    private Memory<ulong> _state;
+
+    internal SHA3Managed(int hashBitLength)
     {
-        private int keccakR;
-        private int hashSize;
-        public override int HashSize => hashSize;
-        protected int SizeInBytes => keccakR / 8;
-        protected int HashByteLength => HashSize / 8;
-        private const int KeccakB = 1600;
-        private const int KeccakNumberOfRounds = 24;
-        private const int KeccakLaneSizeInBits = 8 * 8;
-        private static readonly ulong[] RoundConstants = new ulong[]
+        if (hashBitLength != 224 && hashBitLength != 256 && hashBitLength != 384 && hashBitLength != 512)
+            throw new ArgumentException("hashBitLength must be 224, 256, 384, or 512", nameof(hashBitLength));
+
+        HashSize = hashBitLength;
+        _keccakR = hashBitLength switch
         {
-            0x0000000000000001UL,
-            0x0000000000008082UL,
-            0x800000000000808aUL,
-            0x8000000080008000UL,
-            0x000000000000808bUL,
-            0x0000000080000001UL,
-            0x8000000080008081UL,
-            0x8000000000008009UL,
-            0x000000000000008aUL,
-            0x0000000000000088UL,
-            0x0000000080008009UL,
-            0x000000008000000aUL,
-            0x000000008000808bUL,
-            0x800000000000008bUL,
-            0x8000000000008089UL,
-            0x8000000000008003UL,
-            0x8000000000008002UL,
-            0x8000000000000080UL,
-            0x000000000000800aUL,
-            0x800000008000000aUL,
-            0x8000000080008081UL,
-            0x8000000000008080UL,
-            0x0000000080000001UL,
-            0x8000000080008008UL
+            224 => 1152,
+            256 => 1088,
+            384 => 832,
+            512 => 576,
+            _ => _keccakR
         };
-        private ulong[] state;
-        private byte[] buffer;
-        private int buffLength;
-        internal SHA3Managed(int hashBitLength)
-        {
-            if (hashBitLength != 224 && hashBitLength != 256 && hashBitLength != 384 && hashBitLength != 512)
-                throw new ArgumentException("hashBitLength must be 224, 256, 384, or 512", nameof(hashBitLength));
-            hashSize = hashBitLength;
-            switch (hashBitLength)
-            {
-                case 224:
-                    keccakR = 1152;
-                    break;
-                case 256:
-                    keccakR = 1088;
-                    break;
-                case 384:
-                    keccakR = 832;
-                    break;
-                case 512:
-                    keccakR = 576;
-                    break;
-            }
-            Initialize();
-        }
 
-        public override void Initialize()
-        {
-            buffer = new byte[SizeInBytes];
-            buffLength = 0;
-            state = new ulong[5 * 5];//1600 bits
-        }
+        Initialize();
+    }
 
-        private void AddToBuffer(ReadOnlySpan<byte> array, ref int offset, ref int count)
-        {
-            int amount = Math.Min(count, buffer.Length - buffLength);
-            array.Slice(offset, amount).CopyTo(new Span<byte>(buffer, buffLength, amount));
-            offset += amount;
-            buffLength += amount;
-            count -= amount;
-        }
+    public override int HashSize { get; }
 
-        protected override void HashCore(byte[] array, int ibStart, int cbSize)
-        {
-            base.HashCore(array, ibStart, cbSize);
-            if (cbSize == 0)
-                return;
-            int stride = SizeInBytes >> 3;
-            ulong[] utemps = new ulong[stride];
-            if (buffLength == SizeInBytes)
-                throw new Exception("Unexpected error, the internal buffer is full");
-            AddToBuffer(array, ref ibStart, ref cbSize);
-            if (buffLength == SizeInBytes)//buffer full
-            {
-                Buffer.BlockCopy(buffer, 0, utemps, 0, SizeInBytes);
-                KeccakF(utemps, stride);
-                buffLength = 0;
-            }
-            for (; cbSize >= SizeInBytes; cbSize -= SizeInBytes, ibStart += SizeInBytes)
-            {
-                Buffer.BlockCopy(array, ibStart, utemps, 0, SizeInBytes);
-                KeccakF(utemps, stride);
-            }
-            if (cbSize > 0)//some left over
-            {
-                Buffer.BlockCopy(array, ibStart, buffer, buffLength, cbSize);
-                buffLength += cbSize;
-            }
-        }
+    protected int SizeInBytes => _keccakR / 8;
+    protected int HashByteLength => HashSize / 8;
 
-        protected override byte[] HashFinal()
+    public sealed override void Initialize()
+    {
+        _buffer = new byte[SizeInBytes];
+        _buffLength = 0;
+        _state = new ulong[5 * 5]; // 1600 bits
+    }
+
+    private void AddToBuffer(in ReadOnlySpan<byte> array, ref int offset, ref int count)
+    {
+        var amount = Math.Min(count, _buffer.Length - _buffLength);
+        array[offset..(offset + amount)].CopyTo(_buffer.Span[_buffLength..(_buffLength + amount)]);
+
+        offset += amount;
+        _buffLength += amount;
+        count -= amount;
+    }
+
+    protected override void HashCore(byte[] array, int ibStart, int cbSize)
+    {
+        var source = array.AsSpan();
+        base.HashCore(source.Slice(ibStart, cbSize), 0, cbSize);
+        if (cbSize == 0)
+            return;
+
+        var stride = SizeInBytes / sizeof(ulong);
+
+        if (_buffLength == SizeInBytes)
+            throw new Exception("Unexpected error, the internal buffer is full");
+
+        AddToBuffer(source, ref ibStart, ref cbSize);
+
+        Span<ulong> utemps = stackalloc ulong[stride];
+        if (_buffLength == SizeInBytes) // buffer full
         {
-            byte[] outb = new byte[HashByteLength];
-            //    padding
-            Array.Clear(buffer, buffLength, SizeInBytes - buffLength);
-            if (UseKeccakPadding)
-                buffer[buffLength++] = 1;//reference had =, others have ^=
-            else
-                buffer[buffLength++] = 6;
-            buffer[SizeInBytes - 1] |= 0x80;
-            int stride = SizeInBytes >> 3;
-            ulong[] utemps = new ulong[stride];
-            Buffer.BlockCopy(buffer, 0, utemps, 0, SizeInBytes);
+            AsUlong(_buffer.Span).CopyTo(utemps);
             KeccakF(utemps, stride);
-            Buffer.BlockCopy(state, 0, outb, 0, HashByteLength);
-            return outb;
+            _buffLength = 0;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private ulong ROL(ulong a, int offset) => ((a) << (offset % KeccakLaneSizeInBits)) ^ ((a) >> (KeccakLaneSizeInBits - (offset % KeccakLaneSizeInBits)));
-
-        private void KeccakF(Span<ulong> inb, int laneCount)
+        while (cbSize >= SizeInBytes)
         {
-            Span<ulong> state = this.state;
-            ReadOnlySpan<ulong> RoundConstants = SHA3Managed.RoundConstants;
-            while (--laneCount >= 0)
-                state[laneCount] ^= inb[laneCount];
-            ulong Aba, Abe, Abi, Abo, Abu;
-            ulong Aga, Age, Agi, Ago, Agu;
-            ulong Aka, Ake, Aki, Ako, Aku;
-            ulong Ama, Ame, Ami, Amo, Amu;
-            ulong Asa, Ase, Asi, Aso, Asu;
-            ulong BCa, BCe, BCi, BCo, BCu;
-            ulong Da, De, Di, Do, Du;
-            ulong Eba, Ebe, Ebi, Ebo, Ebu;
-            ulong Ega, Ege, Egi, Ego, Egu;
-            ulong Eka, Eke, Eki, Eko, Eku;
-            ulong Ema, Eme, Emi, Emo, Emu;
-            ulong Esa, Ese, Esi, Eso, Esu;
-
-            //copyFromState(A, state)
-            Aba = state[0];
-            Abe = state[1];
-            Abi = state[2];
-            Abo = state[3];
-            Abu = state[4];
-            Aga = state[5];
-            Age = state[6];
-            Agi = state[7];
-            Ago = state[8];
-            Agu = state[9];
-            Aka = state[10];
-            Ake = state[11];
-            Aki = state[12];
-            Ako = state[13];
-            Aku = state[14];
-            Ama = state[15];
-            Ame = state[16];
-            Ami = state[17];
-            Amo = state[18];
-            Amu = state[19];
-            Asa = state[20];
-            Ase = state[21];
-            Asi = state[22];
-            Aso = state[23];
-            Asu = state[24];
-
-            for (int round = 0; round < KeccakNumberOfRounds; round += 2)
-            {
-                //    prepareTheta
-                BCa = Aba ^ Aga ^ Aka ^ Ama ^ Asa;
-                BCe = Abe ^ Age ^ Ake ^ Ame ^ Ase;
-                BCi = Abi ^ Agi ^ Aki ^ Ami ^ Asi;
-                BCo = Abo ^ Ago ^ Ako ^ Amo ^ Aso;
-                BCu = Abu ^ Agu ^ Aku ^ Amu ^ Asu;
-
-                //thetaRhoPiChiIotaPrepareTheta(round  , A, E)
-                Da = BCu ^ ROL(BCe, 1);
-                De = BCa ^ ROL(BCi, 1);
-                Di = BCe ^ ROL(BCo, 1);
-                Do = BCi ^ ROL(BCu, 1);
-                Du = BCo ^ ROL(BCa, 1);
-
-                Aba ^= Da;
-                BCa = Aba;
-                Age ^= De;
-                BCe = ROL(Age, 44);
-                Aki ^= Di;
-                BCi = ROL(Aki, 43);
-                Amo ^= Do;
-                BCo = ROL(Amo, 21);
-                Asu ^= Du;
-                BCu = ROL(Asu, 14);
-                Eba = BCa ^ ((~BCe) & BCi);
-                Eba ^= RoundConstants[round];
-                Ebe = BCe ^ ((~BCi) & BCo);
-                Ebi = BCi ^ ((~BCo) & BCu);
-                Ebo = BCo ^ ((~BCu) & BCa);
-                Ebu = BCu ^ ((~BCa) & BCe);
-
-                Abo ^= Do;
-                BCa = ROL(Abo, 28);
-                Agu ^= Du;
-                BCe = ROL(Agu, 20);
-                Aka ^= Da;
-                BCi = ROL(Aka, 3);
-                Ame ^= De;
-                BCo = ROL(Ame, 45);
-                Asi ^= Di;
-                BCu = ROL(Asi, 61);
-                Ega = BCa ^ ((~BCe) & BCi);
-                Ege = BCe ^ ((~BCi) & BCo);
-                Egi = BCi ^ ((~BCo) & BCu);
-                Ego = BCo ^ ((~BCu) & BCa);
-                Egu = BCu ^ ((~BCa) & BCe);
-
-                Abe ^= De;
-                BCa = ROL(Abe, 1);
-                Agi ^= Di;
-                BCe = ROL(Agi, 6);
-                Ako ^= Do;
-                BCi = ROL(Ako, 25);
-                Amu ^= Du;
-                BCo = ROL(Amu, 8);
-                Asa ^= Da;
-                BCu = ROL(Asa, 18);
-                Eka = BCa ^ ((~BCe) & BCi);
-                Eke = BCe ^ ((~BCi) & BCo);
-                Eki = BCi ^ ((~BCo) & BCu);
-                Eko = BCo ^ ((~BCu) & BCa);
-                Eku = BCu ^ ((~BCa) & BCe);
-
-                Abu ^= Du;
-                BCa = ROL(Abu, 27);
-                Aga ^= Da;
-                BCe = ROL(Aga, 36);
-                Ake ^= De;
-                BCi = ROL(Ake, 10);
-                Ami ^= Di;
-                BCo = ROL(Ami, 15);
-                Aso ^= Do;
-                BCu = ROL(Aso, 56);
-                Ema = BCa ^ ((~BCe) & BCi);
-                Eme = BCe ^ ((~BCi) & BCo);
-                Emi = BCi ^ ((~BCo) & BCu);
-                Emo = BCo ^ ((~BCu) & BCa);
-                Emu = BCu ^ ((~BCa) & BCe);
-
-                Abi ^= Di;
-                BCa = ROL(Abi, 62);
-                Ago ^= Do;
-                BCe = ROL(Ago, 55);
-                Aku ^= Du;
-                BCi = ROL(Aku, 39);
-                Ama ^= Da;
-                BCo = ROL(Ama, 41);
-                Ase ^= De;
-                BCu = ROL(Ase, 2);
-                Esa = BCa ^ ((~BCe) & BCi);
-                Ese = BCe ^ ((~BCi) & BCo);
-                Esi = BCi ^ ((~BCo) & BCu);
-                Eso = BCo ^ ((~BCu) & BCa);
-                Esu = BCu ^ ((~BCa) & BCe);
-
-                //    prepareTheta
-                BCa = Eba ^ Ega ^ Eka ^ Ema ^ Esa;
-                BCe = Ebe ^ Ege ^ Eke ^ Eme ^ Ese;
-                BCi = Ebi ^ Egi ^ Eki ^ Emi ^ Esi;
-                BCo = Ebo ^ Ego ^ Eko ^ Emo ^ Eso;
-                BCu = Ebu ^ Egu ^ Eku ^ Emu ^ Esu;
-
-                //thetaRhoPiChiIotaPrepareTheta(round+1, E, A)
-                Da = BCu ^ ROL(BCe, 1);
-                De = BCa ^ ROL(BCi, 1);
-                Di = BCe ^ ROL(BCo, 1);
-                Do = BCi ^ ROL(BCu, 1);
-                Du = BCo ^ ROL(BCa, 1);
-
-                Eba ^= Da;
-                BCa = Eba;
-                Ege ^= De;
-                BCe = ROL(Ege, 44);
-                Eki ^= Di;
-                BCi = ROL(Eki, 43);
-                Emo ^= Do;
-                BCo = ROL(Emo, 21);
-                Esu ^= Du;
-                BCu = ROL(Esu, 14);
-                Aba = BCa ^ ((~BCe) & BCi);
-                Aba ^= RoundConstants[round + 1];
-                Abe = BCe ^ ((~BCi) & BCo);
-                Abi = BCi ^ ((~BCo) & BCu);
-                Abo = BCo ^ ((~BCu) & BCa);
-                Abu = BCu ^ ((~BCa) & BCe);
-
-                Ebo ^= Do;
-                BCa = ROL(Ebo, 28);
-                Egu ^= Du;
-                BCe = ROL(Egu, 20);
-                Eka ^= Da;
-                BCi = ROL(Eka, 3);
-                Eme ^= De;
-                BCo = ROL(Eme, 45);
-                Esi ^= Di;
-                BCu = ROL(Esi, 61);
-                Aga = BCa ^ ((~BCe) & BCi);
-                Age = BCe ^ ((~BCi) & BCo);
-                Agi = BCi ^ ((~BCo) & BCu);
-                Ago = BCo ^ ((~BCu) & BCa);
-                Agu = BCu ^ ((~BCa) & BCe);
-
-                Ebe ^= De;
-                BCa = ROL(Ebe, 1);
-                Egi ^= Di;
-                BCe = ROL(Egi, 6);
-                Eko ^= Do;
-                BCi = ROL(Eko, 25);
-                Emu ^= Du;
-                BCo = ROL(Emu, 8);
-                Esa ^= Da;
-                BCu = ROL(Esa, 18);
-                Aka = BCa ^ ((~BCe) & BCi);
-                Ake = BCe ^ ((~BCi) & BCo);
-                Aki = BCi ^ ((~BCo) & BCu);
-                Ako = BCo ^ ((~BCu) & BCa);
-                Aku = BCu ^ ((~BCa) & BCe);
-
-                Ebu ^= Du;
-                BCa = ROL(Ebu, 27);
-                Ega ^= Da;
-                BCe = ROL(Ega, 36);
-                Eke ^= De;
-                BCi = ROL(Eke, 10);
-                Emi ^= Di;
-                BCo = ROL(Emi, 15);
-                Eso ^= Do;
-                BCu = ROL(Eso, 56);
-                Ama = BCa ^ ((~BCe) & BCi);
-                Ame = BCe ^ ((~BCi) & BCo);
-                Ami = BCi ^ ((~BCo) & BCu);
-                Amo = BCo ^ ((~BCu) & BCa);
-                Amu = BCu ^ ((~BCa) & BCe);
-
-                Ebi ^= Di;
-                BCa = ROL(Ebi, 62);
-                Ego ^= Do;
-                BCe = ROL(Ego, 55);
-                Eku ^= Du;
-                BCi = ROL(Eku, 39);
-                Ema ^= Da;
-                BCo = ROL(Ema, 41);
-                Ese ^= De;
-                BCu = ROL(Ese, 2);
-                Asa = BCa ^ ((~BCe) & BCi);
-                Ase = BCe ^ ((~BCi) & BCo);
-                Asi = BCi ^ ((~BCo) & BCu);
-                Aso = BCo ^ ((~BCu) & BCa);
-                Asu = BCu ^ ((~BCa) & BCe);
-            }
-
-            //copyToState(state, A)
-            state[0] = Aba;
-            state[1] = Abe;
-            state[2] = Abi;
-            state[3] = Abo;
-            state[4] = Abu;
-            state[5] = Aga;
-            state[6] = Age;
-            state[7] = Agi;
-            state[8] = Ago;
-            state[9] = Agu;
-            state[10] = Aka;
-            state[11] = Ake;
-            state[12] = Aki;
-            state[13] = Ako;
-            state[14] = Aku;
-            state[15] = Ama;
-            state[16] = Ame;
-            state[17] = Ami;
-            state[18] = Amo;
-            state[19] = Amu;
-            state[20] = Asa;
-            state[21] = Ase;
-            state[22] = Asi;
-            state[23] = Aso;
-            state[24] = Asu;
-
+            AsUlong(source.Slice(ibStart, SizeInBytes)).CopyTo(utemps);
+            KeccakF(utemps, stride);
+            ibStart += SizeInBytes;
+            cbSize -= SizeInBytes;
         }
+
+        if (cbSize == 0) return; // some left over
+        array.AsSpan().Slice(ibStart, cbSize).CopyTo(_buffer.Span[_buffLength..]);
+        _buffLength += cbSize;
+    }
+
+    protected override byte[] HashFinal()
+    {
+        _buffer.Span[_buffLength..SizeInBytes].Clear();
+
+        if (UseKeccakPadding)
+            _buffer.Span[_buffLength++] = 1; // reference had =, others have ^=
+        else
+            _buffer.Span[_buffLength++] = 6;
+        _buffer.Span[SizeInBytes - 1] |= 0x80;
+        var stride = SizeInBytes >> 3;
+
+        var utemps = AsUlong(_buffer.Span);
+
+        KeccakF(utemps, stride);
+        return AsBytes(_state.Span, HashByteLength).ToArray();
+    }
+
+    private static Span<ulong> AsUlong(in Span<byte> span)
+    {
+        return MemoryMarshal.Cast<byte, ulong>(span);
+    }
+
+    private static Span<byte> AsBytes<T>(in Span<T> span, in int length) where T : unmanaged
+    {
+        return MemoryMarshal.Cast<T, byte>(span)[..length];
+    }
+
+    //[MethodImpl(MethodImplOptions.AggressiveInlining)]
+    //private static ulong Rol(in ulong a, in int offset)
+    //{
+    //    return (a << (offset % KeccakLaneSizeInBits)) ^ (a >> (KeccakLaneSizeInBits - offset % KeccakLaneSizeInBits));
+    //}
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Rol(ulong a, int offset)
+    {
+        offset &= KeccakLaneSizeInBits - 1;
+        return (a << offset) | (a >> (KeccakLaneSizeInBits - offset));
+    }
+
+    private void KeccakF(Span<ulong> inb, int laneCount)
+    {
+        var state = _state.Span;
+        var roundConstants = RoundConstants.Span;
+        while (--laneCount >= 0)
+            state[laneCount] ^= inb[laneCount];
+
+        //copyFromState(A, state)
+        var aba = state[0];
+        var abe = state[1];
+        var abi = state[2];
+        var abo = state[3];
+        var abu = state[4];
+        var aga = state[5];
+        var age = state[6];
+        var agi = state[7];
+        var ago = state[8];
+        var agu = state[9];
+        var aka = state[10];
+        var ake = state[11];
+        var aki = state[12];
+        var ako = state[13];
+        var aku = state[14];
+        var ama = state[15];
+        var ame = state[16];
+        var ami = state[17];
+        var amo = state[18];
+        var amu = state[19];
+        var asa = state[20];
+        var ase = state[21];
+        var asi = state[22];
+        var aso = state[23];
+        var asu = state[24];
+
+        for (var round = 0; round < KeccakNumberOfRounds; round += 2)
+        {
+            //    prepareTheta
+            var bCa = aba ^ aga ^ aka ^ ama ^ asa;
+            var bCe = abe ^ age ^ ake ^ ame ^ ase;
+            var bCi = abi ^ agi ^ aki ^ ami ^ asi;
+            var bCo = abo ^ ago ^ ako ^ amo ^ aso;
+            var bCu = abu ^ agu ^ aku ^ amu ^ asu;
+
+            //thetaRhoPiChiIotaPrepareTheta(round  , A, E)
+            var da = bCu ^ Rol(bCe, 1);
+            var de = bCa ^ Rol(bCi, 1);
+            var di = bCe ^ Rol(bCo, 1);
+            var @do = bCi ^ Rol(bCu, 1);
+            var du = bCo ^ Rol(bCa, 1);
+
+            aba ^= da;
+            bCa = aba;
+            age ^= de;
+            bCe = Rol(age, 44);
+            aki ^= di;
+            bCi = Rol(aki, 43);
+            amo ^= @do;
+            bCo = Rol(amo, 21);
+            asu ^= du;
+            bCu = Rol(asu, 14);
+            var eba = bCa ^ (~bCe & bCi);
+            eba ^= roundConstants[round];
+            var ebe = bCe ^ (~bCi & bCo);
+            var ebi = bCi ^ (~bCo & bCu);
+            var ebo = bCo ^ (~bCu & bCa);
+            var ebu = bCu ^ (~bCa & bCe);
+
+            abo ^= @do;
+            bCa = Rol(abo, 28);
+            agu ^= du;
+            bCe = Rol(agu, 20);
+            aka ^= da;
+            bCi = Rol(aka, 3);
+            ame ^= de;
+            bCo = Rol(ame, 45);
+            asi ^= di;
+            bCu = Rol(asi, 61);
+            var ega = bCa ^ (~bCe & bCi);
+            var ege = bCe ^ (~bCi & bCo);
+            var egi = bCi ^ (~bCo & bCu);
+            var ego = bCo ^ (~bCu & bCa);
+            var egu = bCu ^ (~bCa & bCe);
+
+            abe ^= de;
+            bCa = Rol(abe, 1);
+            agi ^= di;
+            bCe = Rol(agi, 6);
+            ako ^= @do;
+            bCi = Rol(ako, 25);
+            amu ^= du;
+            bCo = Rol(amu, 8);
+            asa ^= da;
+            bCu = Rol(asa, 18);
+            var eka = bCa ^ (~bCe & bCi);
+            var eke = bCe ^ (~bCi & bCo);
+            var eki = bCi ^ (~bCo & bCu);
+            var eko = bCo ^ (~bCu & bCa);
+            var eku = bCu ^ (~bCa & bCe);
+
+            abu ^= du;
+            bCa = Rol(abu, 27);
+            aga ^= da;
+            bCe = Rol(aga, 36);
+            ake ^= de;
+            bCi = Rol(ake, 10);
+            ami ^= di;
+            bCo = Rol(ami, 15);
+            aso ^= @do;
+            bCu = Rol(aso, 56);
+            var ema = bCa ^ (~bCe & bCi);
+            var eme = bCe ^ (~bCi & bCo);
+            var emi = bCi ^ (~bCo & bCu);
+            var emo = bCo ^ (~bCu & bCa);
+            var emu = bCu ^ (~bCa & bCe);
+
+            abi ^= di;
+            bCa = Rol(abi, 62);
+            ago ^= @do;
+            bCe = Rol(ago, 55);
+            aku ^= du;
+            bCi = Rol(aku, 39);
+            ama ^= da;
+            bCo = Rol(ama, 41);
+            ase ^= de;
+            bCu = Rol(ase, 2);
+            var esa = bCa ^ (~bCe & bCi);
+            var ese = bCe ^ (~bCi & bCo);
+            var esi = bCi ^ (~bCo & bCu);
+            var eso = bCo ^ (~bCu & bCa);
+            var esu = bCu ^ (~bCa & bCe);
+
+            //    prepareTheta
+            bCa = eba ^ ega ^ eka ^ ema ^ esa;
+            bCe = ebe ^ ege ^ eke ^ eme ^ ese;
+            bCi = ebi ^ egi ^ eki ^ emi ^ esi;
+            bCo = ebo ^ ego ^ eko ^ emo ^ eso;
+            bCu = ebu ^ egu ^ eku ^ emu ^ esu;
+
+            //thetaRhoPiChiIotaPrepareTheta(round+1, E, A)
+            da = bCu ^ Rol(bCe, 1);
+            de = bCa ^ Rol(bCi, 1);
+            di = bCe ^ Rol(bCo, 1);
+            @do = bCi ^ Rol(bCu, 1);
+            du = bCo ^ Rol(bCa, 1);
+
+            eba ^= da;
+            bCa = eba;
+            ege ^= de;
+            bCe = Rol(ege, 44);
+            eki ^= di;
+            bCi = Rol(eki, 43);
+            emo ^= @do;
+            bCo = Rol(emo, 21);
+            esu ^= du;
+            bCu = Rol(esu, 14);
+            aba = bCa ^ (~bCe & bCi);
+            aba ^= roundConstants[round + 1];
+            abe = bCe ^ (~bCi & bCo);
+            abi = bCi ^ (~bCo & bCu);
+            abo = bCo ^ (~bCu & bCa);
+            abu = bCu ^ (~bCa & bCe);
+
+            ebo ^= @do;
+            bCa = Rol(ebo, 28);
+            egu ^= du;
+            bCe = Rol(egu, 20);
+            eka ^= da;
+            bCi = Rol(eka, 3);
+            eme ^= de;
+            bCo = Rol(eme, 45);
+            esi ^= di;
+            bCu = Rol(esi, 61);
+            aga = bCa ^ (~bCe & bCi);
+            age = bCe ^ (~bCi & bCo);
+            agi = bCi ^ (~bCo & bCu);
+            ago = bCo ^ (~bCu & bCa);
+            agu = bCu ^ (~bCa & bCe);
+
+            ebe ^= de;
+            bCa = Rol(ebe, 1);
+            egi ^= di;
+            bCe = Rol(egi, 6);
+            eko ^= @do;
+            bCi = Rol(eko, 25);
+            emu ^= du;
+            bCo = Rol(emu, 8);
+            esa ^= da;
+            bCu = Rol(esa, 18);
+            aka = bCa ^ (~bCe & bCi);
+            ake = bCe ^ (~bCi & bCo);
+            aki = bCi ^ (~bCo & bCu);
+            ako = bCo ^ (~bCu & bCa);
+            aku = bCu ^ (~bCa & bCe);
+
+            ebu ^= du;
+            bCa = Rol(ebu, 27);
+            ega ^= da;
+            bCe = Rol(ega, 36);
+            eke ^= de;
+            bCi = Rol(eke, 10);
+            emi ^= di;
+            bCo = Rol(emi, 15);
+            eso ^= @do;
+            bCu = Rol(eso, 56);
+            ama = bCa ^ (~bCe & bCi);
+            ame = bCe ^ (~bCi & bCo);
+            ami = bCi ^ (~bCo & bCu);
+            amo = bCo ^ (~bCu & bCa);
+            amu = bCu ^ (~bCa & bCe);
+
+            ebi ^= di;
+            bCa = Rol(ebi, 62);
+            ego ^= @do;
+            bCe = Rol(ego, 55);
+            eku ^= du;
+            bCi = Rol(eku, 39);
+            ema ^= da;
+            bCo = Rol(ema, 41);
+            ese ^= de;
+            bCu = Rol(ese, 2);
+            asa = bCa ^ (~bCe & bCi);
+            ase = bCe ^ (~bCi & bCo);
+            asi = bCi ^ (~bCo & bCu);
+            aso = bCo ^ (~bCu & bCa);
+            asu = bCu ^ (~bCa & bCe);
+        }
+
+        //copyToState(state, A)
+        state[0] = aba;
+        state[1] = abe;
+        state[2] = abi;
+        state[3] = abo;
+        state[4] = abu;
+        state[5] = aga;
+        state[6] = age;
+        state[7] = agi;
+        state[8] = ago;
+        state[9] = agu;
+        state[10] = aka;
+        state[11] = ake;
+        state[12] = aki;
+        state[13] = ako;
+        state[14] = aku;
+        state[15] = ama;
+        state[16] = ame;
+        state[17] = ami;
+        state[18] = amo;
+        state[19] = amu;
+        state[20] = asa;
+        state[21] = ase;
+        state[22] = asi;
+        state[23] = aso;
+        state[24] = asu;
     }
 }
